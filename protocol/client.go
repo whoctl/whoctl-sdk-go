@@ -78,6 +78,22 @@ func (c *Client) Aliases() []string { return c.handshake.Aliases }
 // Handlers implements core.Provider.
 func (c *Client) Handlers() []core.Handler { return c.handlers }
 
+// Version is the provider's own release version, as it reported at handshake.
+//
+// It is exposed for one reason: a provider is a separate binary, released on
+// its own schedule and often built in a checkout beside this one, and "which
+// binary am I actually running" is the question that costs the most time to
+// answer wrong. Whoever can spawn it can ask it.
+func (c *Client) Version() string { return c.handshake.Version }
+
+// Protocol is the version of this contract the provider implements.
+//
+// A connected client always reports what whoctl speaks, because Connect refuses
+// anything else. It is exposed so the column exists at all: the interesting
+// case is the provider that is missing from the list, and a table with nowhere
+// to say "protocol 1" has nowhere to explain why.
+func (c *Client) Protocol() string { return c.handshake.Protocol }
+
 // HonoursDryRun reports the provider's own claim. whoctl cannot verify it: a
 // provider it did not write could ignore the flag entirely, which is the price
 // of out-of-tree providers and is why the claim is recorded rather than
