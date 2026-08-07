@@ -59,6 +59,38 @@ type Restarter interface {
 	Restart(ctx context.Context, name string) error
 }
 
+// EventType is what happened to an object in a watch, using Kubernetes'
+// vocabulary because these events are what a Kubernetes client consumes.
+type EventType string
+
+const (
+	EventAdded    EventType = "ADDED"
+	EventModified EventType = "MODIFIED"
+	EventDeleted  EventType = "DELETED"
+)
+
+// Event is one change to one object.
+type Event struct {
+	Type   EventType
+	Object Object
+}
+
+// Watcher is optional: handlers implementing it stream changes instead of only
+// answering point-in-time questions.
+//
+// It exists because a table that never updates is all a client can draw without
+// it — k9s and Lens are built on streams, and polling every kind of every
+// provider is what they were written to stop doing.
+//
+// Watch returns when ctx is cancelled, when the stream ends of its own accord,
+// or when emit fails, which is how the far side says it stopped listening. A
+// provider with nothing better to offer may implement this by polling its own
+// List; that is still worth doing, because where the polling lives is the
+// difference between one provider doing it and every client doing it.
+type Watcher interface {
+	Watch(ctx context.Context, emit func(Event) error) error
+}
+
 // ScopedLister is optional: handlers implementing it read a positional argument
 // as the scope of a listing rather than as the name of one object, so `get` and
 // `describe` expand it into however many objects it covers.

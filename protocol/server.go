@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 
 	"github.com/whoctl/whoctl-sdk-go/core"
 )
@@ -30,12 +31,27 @@ type Server struct {
 	HonoursDryRun bool
 
 	provider core.Provider
-	handlers map[string]core.Handler
+	// handlers is keyed by the whole triple. Keying it by kind alone let one
+	// handler replace another the moment a provider served two kinds of the
+	// same name in different groups, which is ordinary for a provider covering
+	// several services of one cloud.
+	handlers map[Ref]core.Handler
+
+	// watches are the streams currently open, so stopWatch can end one. The
+	// mutex guards it because a watch runs concurrently with the requests
+	// arriving behind it — that is the whole reason it is a stream.
+	mu      sync.Mutex
+	watches map[int]context.CancelFunc
 }
 
 // NewServer wraps a provider constructor.
 func NewServer(new ProviderFunc) *Server {
-	return &Server{newProvider: new, HonoursDryRun: true, handlers: map[string]core.Handler{}}
+	return &Server{
+		newProvider:   new,
+		HonoursDryRun: true,
+		handlers:      map[Ref]core.Handler{},
+		watches:       map[int]context.CancelFunc{},
+	}
 }
 
 // NewServerOf wraps a provider that is already built, for a caller that has no
@@ -74,7 +90,15 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 		}
 		s.provider = p
 		for _, h := range p.Handlers() {
-			s.handlers[h.Type().Kind] = h
+			ref := RefOf(h.Type())
+			if _, clash := s.handlers[ref]; clash {
+				// Two handlers under one triple is a provider bug that used to
+				// be silent, and the symptom was one kind answering for
+				// another. providertest catches it; this is the backstop for a
+				// provider that never ran the suite.
+				return nil, core.Invalidf("this provider serves %s twice", ref)
+			}
+			s.handlers[ref] = h
 		}
 		return Handshake{
 			Protocol:      Version,
@@ -92,15 +116,27 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 		return nil, core.Invalidf("no handshake: whoctl must call %q before anything else", MethodHandshake)
 	}
 
-	// Everything else names a kind.
-	kind, err := kindOf(req.Params)
+	if req.Method == MethodStopWatch {
+		var params StopWatchParams
+		if err := decodeParams(req.Params, &params); err != nil {
+			return nil, err
+		}
+		s.stopWatch(params.Watch)
+		// Stopping a watch that already ended is not a failure: the stream may
+		// have closed itself between the last frame and this call.
+		return struct{}{}, nil
+	}
+
+	// Everything else names a kind, and may name a namespace to answer for.
+	h, ref, err := s.handlerFor(req.Params)
 	if err != nil {
 		return nil, err
 	}
-	h, ok := s.handlers[kind]
-	if !ok {
-		return nil, core.Invalidf("this provider serves no kind %q", kind)
+	ctx, err = withScope(ctx, req.Params)
+	if err != nil {
+		return nil, err
 	}
+	kind := ref.Kind
 
 	switch req.Method {
 	case MethodList:
@@ -109,6 +145,9 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 			return nil, err
 		}
 		return objectsResult(objs)
+
+	case MethodWatch:
+		return nil, core.Invalidf("%s is a stream and this transport did not open one", MethodWatch)
 
 	case MethodGet:
 		var params NameParams
@@ -202,6 +241,67 @@ func (s *Server) dispatch(ctx context.Context, req Request) (any, error) {
 	return nil, core.Invalidf("unknown method %q", req.Method)
 }
 
+// HandleStream answers a request that may be a stream, emitting one frame per
+// answer. A method that is not streaming emits exactly one and returns.
+//
+// # Why the provider side grew concurrency
+//
+// A watch runs until somebody stops it, and the requests behind it have to keep
+// being served — a `get` while a table is streaming is the ordinary case, not
+// an exotic one. So a watch runs in its own goroutine and the transport
+// serializes the writing.
+//
+// That concurrency reaches exactly the handlers that implement core.Watcher and
+// no others: a provider with no watch is called the way it always was, one
+// request at a time. A provider that does implement it is saying its Watch may
+// run alongside its other verbs.
+func (s *Server) HandleStream(ctx context.Context, req Request, emit func(Response) error) error {
+	if !Streaming(req.Method) {
+		return emit(s.Handle(ctx, req))
+	}
+	if s.provider == nil {
+		return emit(Response{ID: req.ID, Error: errorOf(
+			core.Invalidf("no handshake: whoctl must call %q before anything else", MethodHandshake))})
+	}
+
+	h, ref, err := s.handlerFor(req.Params)
+	if err != nil {
+		return emit(Response{ID: req.ID, Error: errorOf(err)})
+	}
+	watcher, ok := h.(core.Watcher)
+	if !ok {
+		return emit(Response{ID: req.ID, Error: errorOf(core.Unsupportedf("%s is not watched", ref.Kind))})
+	}
+	scoped, err := withScope(ctx, req.Params)
+	if err != nil {
+		return emit(Response{ID: req.ID, Error: errorOf(err)})
+	}
+
+	scoped, cancel := context.WithCancel(scoped)
+	defer cancel()
+	s.startWatch(req.ID, cancel)
+	defer s.stopWatch(req.ID)
+
+	err = watcher.Watch(scoped, func(event core.Event) error {
+		wire, err := ObjectFrom(event.Object)
+		if err != nil {
+			return err
+		}
+		encoded, err := json.Marshal(EventResult{Type: string(event.Type), Object: wire})
+		if err != nil {
+			return err
+		}
+		return emit(Response{ID: req.ID, Result: encoded, Stream: true})
+	})
+	// A watch the far side stopped ends normally: cancellation is how it says
+	// so, and reporting it as a failure would print an error for every `-w`
+	// somebody ctrl-C'd.
+	if err != nil && scoped.Err() == nil {
+		return emit(Response{ID: req.ID, Error: errorOf(err)})
+	}
+	return emit(Response{ID: req.ID})
+}
+
 func (s *Server) schema() Schema {
 	var out Schema
 	for _, h := range s.provider.Handlers() {
@@ -209,6 +309,13 @@ func (s *Server) schema() Schema {
 		rt := ResourceType{
 			Group: t.Group, Version: t.Version, Kind: t.Kind,
 			Plural: t.Plural, Singular: t.Singular, ShortNames: t.ShortNames,
+			// Both are sent resolved rather than defaulted on arrival, so the
+			// two sides cannot disagree about what a kind is called or what it
+			// serves.
+			ListKind:    t.CollectionKind(),
+			Verbs:       core.VerbsOf(h),
+			Namespaced:  t.Namespaced,
+			Categories:  t.Categories,
 			Description: t.Description,
 			Spec:        core.SpecFieldsOf(h),
 			Status:      core.StatusFieldsOf(h),
@@ -239,10 +346,13 @@ func ObjectFrom(o core.Object) (Object, error) {
 		APIVersion: o.APIVersion,
 		Kind:       o.Kind,
 		Metadata: Metadata{
-			Name:        o.Metadata.Name,
-			Namespace:   o.Metadata.Namespace,
-			Labels:      o.Metadata.Labels,
-			Annotations: o.Metadata.Annotations,
+			Name:              o.Metadata.Name,
+			Namespace:         o.Metadata.Namespace,
+			UID:               o.Metadata.UID,
+			ResourceVersion:   o.Metadata.ResourceVersion,
+			CreationTimestamp: o.Metadata.CreationTimestamp,
+			Labels:            o.Metadata.Labels,
+			Annotations:       o.Metadata.Annotations,
 		},
 		Spec:   spec,
 		Status: status,
@@ -257,10 +367,13 @@ func (o Object) Decode(spec any) (core.Object, error) {
 		APIVersion: o.APIVersion,
 		Kind:       o.Kind,
 		Metadata: core.Metadata{
-			Name:        o.Metadata.Name,
-			Namespace:   o.Metadata.Namespace,
-			Labels:      o.Metadata.Labels,
-			Annotations: o.Metadata.Annotations,
+			Name:              o.Metadata.Name,
+			Namespace:         o.Metadata.Namespace,
+			UID:               o.Metadata.UID,
+			ResourceVersion:   o.Metadata.ResourceVersion,
+			CreationTimestamp: o.Metadata.CreationTimestamp,
+			Labels:            o.Metadata.Labels,
+			Annotations:       o.Metadata.Annotations,
 		},
 		Status: statusValue(o.Status),
 	}
@@ -314,15 +427,54 @@ func decodeParams(raw json.RawMessage, into any) error {
 	return nil
 }
 
-func kindOf(raw json.RawMessage) (string, error) {
+// handlerFor resolves the triple every per-kind request carries.
+func (s *Server) handlerFor(raw json.RawMessage) (core.Handler, Ref, error) {
 	var params KindParams
 	if err := decodeParams(raw, &params); err != nil {
-		return "", err
+		return nil, Ref{}, err
 	}
 	if params.Kind == "" {
-		return "", core.Invalidf("no kind given")
+		return nil, Ref{}, core.Invalidf("no kind given")
 	}
-	return params.Kind, nil
+	h, ok := s.handlers[params.Ref]
+	if !ok {
+		// Naming the whole triple matters here: a provider that serves the kind
+		// in another group is a different mistake from one that does not serve
+		// it at all, and the message is all whoctl has to tell them apart.
+		return nil, params.Ref, core.Invalidf("this provider serves no %s", params.Ref)
+	}
+	return h, params.Ref, nil
+}
+
+// withScope puts the namespace the call named onto the context, the way delete
+// options travel. A handler for a kind with no namespaces never reads it.
+func withScope(ctx context.Context, raw json.RawMessage) (context.Context, error) {
+	var params KindParams
+	if err := decodeParams(raw, &params); err != nil {
+		return ctx, err
+	}
+	return core.WithScope(ctx, core.Scope{
+		Namespace:     params.Namespace,
+		AllNamespaces: params.AllNamespaces,
+		LabelSelector: params.LabelSelector,
+		FieldSelector: params.FieldSelector,
+	}), nil
+}
+
+func (s *Server) startWatch(id int, cancel context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.watches[id] = cancel
+}
+
+func (s *Server) stopWatch(id int) {
+	s.mu.Lock()
+	cancel := s.watches[id]
+	delete(s.watches, id)
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func aliasesOf(p core.Provider) []string {

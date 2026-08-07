@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/whoctl/whoctl-sdk-go/core"
@@ -53,18 +54,39 @@ func beAProvider(mode string) int {
 	return 0
 }
 
-func subprocessClient(t *testing.T, cfg Config, mode string) (*Client, *bytes.Buffer, *Subprocess) {
+// syncBuffer is the provider's stderr. It has to be locked: the child's stderr
+// is copied into it by a goroutine os/exec owns, and a test reading it is a
+// second one. Without this the suite cannot be run under -race at all, which is
+// how a transport with goroutines of its own stops being checkable.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func subprocessClient(t *testing.T, cfg Config, mode string) (*Client, *syncBuffer, *Subprocess) {
 	t.Helper()
-	var stderr bytes.Buffer
-	transport := NewSubprocess(os.Args[0], &stderr)
-	transport.env = append(os.Environ(), provideEnv+"="+mode)
+	stderr := &syncBuffer{}
+	transport := NewSubprocess(os.Args[0], stderr)
+	transport.Env = append(os.Environ(), provideEnv+"="+mode)
 
 	client, err := Connect(context.Background(), transport, cfg)
 	if err != nil {
 		t.Fatalf("connect: %v\nprovider stderr:\n%s", err, stderr.String())
 	}
 	t.Cleanup(func() { _ = transport.Close() })
-	return client, &stderr, transport
+	return client, stderr, transport
 }
 
 // The whole arrangement in one test: a provider in another process, answering.
@@ -135,7 +157,7 @@ func TestErrorCodesSurviveTheSubprocess(t *testing.T) {
 func TestAProviderThatDiesIsReportedAsOne(t *testing.T) {
 	var stderr bytes.Buffer
 	transport := NewSubprocess(os.Args[0], &stderr)
-	transport.env = append(os.Environ(), provideEnv+"=crash")
+	transport.Env = append(os.Environ(), provideEnv+"=crash")
 
 	_, err := Connect(context.Background(), transport, Config{})
 	if err == nil {
@@ -154,7 +176,7 @@ func TestAProviderThatDiesIsReportedAsOne(t *testing.T) {
 func TestAProviderWritingToStdoutIsReported(t *testing.T) {
 	var stderr bytes.Buffer
 	transport := NewSubprocess(os.Args[0], &stderr)
-	transport.env = append(os.Environ(), provideEnv+"=garbage")
+	transport.Env = append(os.Environ(), provideEnv+"=garbage")
 
 	_, err := Connect(context.Background(), transport, Config{})
 	if err == nil {
@@ -205,4 +227,78 @@ func TestFramingSurvivesNewlinesInTheData(t *testing.T) {
 		t.Errorf("a response spans more than one line: %q", line)
 	}
 	_ = inWriter.Close()
+}
+
+// The whole reason the transport demultiplexes, across a real process
+// boundary: a watch is open and its frames are arriving, and an ordinary get
+// goes down the same pipe and comes back with its own answer.
+//
+// The old transport wrote a request and read the next line back. Here that line
+// is the watch's next event, so the get would have returned somebody else's
+// answer — and it would have looked like a decoding bug, not a framing one.
+func TestAWatchAndAGetShareOnePipe(t *testing.T) {
+	client, stderr, _ := subprocessClient(t, Config{}, "serve")
+	widget := handlerFor(t, client, "Widget")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	events := make(chan string, 8)
+	watched := make(chan error, 1)
+	go func() {
+		watched <- widget.(core.Watcher).Watch(ctx, func(e core.Event) error {
+			events <- e.Object.Metadata.Name
+			return nil
+		})
+	}()
+
+	// Wait until the stream is really running, so the get below is issued with
+	// a watch open rather than racing it.
+	if first := <-events; first != "one" {
+		t.Fatalf("first event = %q, want %q", first, "one")
+	}
+
+	obj, err := widget.Get(ctx, "one")
+	if err != nil {
+		t.Fatalf("get while watching: %v\nprovider stderr:\n%s", err, stderr.String())
+	}
+	if obj.Metadata.Name != "one" || obj.Kind != "Widget" {
+		t.Errorf("the get was answered with %s %q", obj.Kind, obj.Metadata.Name)
+	}
+	if second := <-events; second != "two" {
+		t.Errorf("second event = %q, want %q", second, "two")
+	}
+
+	cancel()
+	if err := <-watched; err != nil {
+		t.Errorf("watch ended with %v, want a clean stop", err)
+	}
+}
+
+// And a watch really ends on the provider's side: it is sitting in a Watch that
+// returns when it is told to, so a reader that walks away without saying so
+// would leave the stream running for the life of the process.
+func TestStoppingAWatchReachesTheProvider(t *testing.T) {
+	client, _, _ := subprocessClient(t, Config{}, "serve")
+	widget := handlerFor(t, client, "Widget")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	seen := 0
+	err := widget.(core.Watcher).Watch(ctx, func(core.Event) error {
+		seen++
+		if seen == 1 {
+			cancel()
+		}
+		return nil
+	})
+	cancel()
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+
+	// The provider is still there and still answering, which is what proves the
+	// stream was closed rather than the connection.
+	if _, err := widget.Get(context.Background(), "one"); err != nil {
+		t.Errorf("the provider stopped answering after a watch was stopped: %v", err)
+	}
 }

@@ -34,6 +34,11 @@ const (
 	// CapabilityStatusSchema is StatusTyper: the kind hands out a zeroed status,
 	// which is what lets the documentation describe its observed fields.
 	CapabilityStatusSchema Capability = "statusSchema"
+	// CapabilityWatch is Watcher: the kind streams changes. It is published
+	// here as well as in ResourceType.Verbs because the two are read by
+	// different sides — whoctl's own commands ask here, and a Kubernetes client
+	// reads the verb.
+	CapabilityWatch Capability = "watch"
 )
 
 // Capable is implemented by a handler that already knows its capabilities
@@ -66,6 +71,9 @@ func CapabilitiesOf(h Handler) []Capability {
 	}
 	if _, ok := h.(StatusTyper); ok {
 		out = append(out, CapabilityStatusSchema)
+	}
+	if _, ok := h.(Watcher); ok {
+		out = append(out, CapabilityWatch)
 	}
 	return out
 }

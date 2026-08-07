@@ -24,24 +24,49 @@ func NewLoopback(s *Server) *Loopback { return &Loopback{server: s} }
 
 // Call implements Transport.
 func (l *Loopback) Call(ctx context.Context, req Request) (Response, error) {
-	wire, err := json.Marshal(req)
+	decoded, err := roundTripRequest(req)
 	if err != nil {
 		return Response{}, err
+	}
+	return roundTripResponse(l.server.Handle(ctx, decoded))
+}
+
+// CallStream implements Transport. The frames go through the same encoding as
+// a single response, because a watch that only worked in one process would be
+// the exact bug this transport exists to catch.
+func (l *Loopback) CallStream(ctx context.Context, req Request, onFrame func(Response) error) error {
+	decoded, err := roundTripRequest(req)
+	if err != nil {
+		return err
+	}
+	return l.server.HandleStream(ctx, decoded, func(resp Response) error {
+		out, err := roundTripResponse(resp)
+		if err != nil {
+			return err
+		}
+		return onFrame(out)
+	})
+}
+
+func roundTripRequest(req Request) (Request, error) {
+	wire, err := json.Marshal(req)
+	if err != nil {
+		return Request{}, err
 	}
 	if bytes.ContainsAny(wire, "\n") {
 		// The stdio transport frames one request per line, so a newline inside
 		// an encoded request would desynchronize it. encoding/json escapes
 		// them, and this is here to notice if that ever stops being true.
-		return Response{}, fmt.Errorf("encoded request contains a newline")
+		return Request{}, fmt.Errorf("encoded request contains a newline")
 	}
-
 	var decoded Request
 	if err := json.Unmarshal(wire, &decoded); err != nil {
-		return Response{}, err
+		return Request{}, err
 	}
+	return decoded, nil
+}
 
-	resp := l.server.Handle(ctx, decoded)
-
+func roundTripResponse(resp Response) (Response, error) {
 	encoded, err := json.Marshal(resp)
 	if err != nil {
 		return Response{}, err

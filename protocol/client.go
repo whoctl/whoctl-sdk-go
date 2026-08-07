@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/whoctl/whoctl-sdk-go/core"
 	"github.com/whoctl/whoctl-sdk-go/schema"
@@ -15,6 +16,11 @@ import (
 // which it is.
 type Transport interface {
 	Call(ctx context.Context, req Request) (Response, error)
+	// CallStream carries a request whose answer is many frames, calling onFrame
+	// for each until one arrives with Stream false. It returns when the stream
+	// ends, when onFrame fails, or when ctx is cancelled — which is how a
+	// reader says it has seen enough.
+	CallStream(ctx context.Context, req Request, onFrame func(Response) error) error
 }
 
 // Client is a core.Provider backed by a Transport. Every handler it hands out
@@ -24,7 +30,20 @@ type Client struct {
 	transport Transport
 	handshake Handshake
 	handlers  []core.Handler
-	nextID    int
+
+	// ids is held only while taking the next one. A watch runs in a goroutine
+	// of its own and the requests beside it keep coming, so two calls really do
+	// number themselves at once — and two requests sharing an id would have the
+	// transport hand one caller the other's answer.
+	ids    sync.Mutex
+	nextID int
+}
+
+func (c *Client) takeID() int {
+	c.ids.Lock()
+	defer c.ids.Unlock()
+	c.nextID++
+	return c.nextID
 }
 
 // Connect performs the handshake and reads the provider's schema, which is
@@ -66,8 +85,7 @@ func (c *Client) Handlers() []core.Handler { return c.handlers }
 func (c *Client) HonoursDryRun() bool { return c.handshake.HonoursDryRun }
 
 func (c *Client) call(ctx context.Context, method string, params, result any) error {
-	c.nextID++
-	req := Request{ID: c.nextID, Method: method}
+	req := Request{ID: c.takeID(), Method: method}
 	if params != nil {
 		encoded, err := json.Marshal(params)
 		if err != nil {
@@ -90,6 +108,53 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 		return nil
 	}
 	return json.Unmarshal(resp.Result, result)
+}
+
+// stream makes a call whose answer is many frames, handing each result to
+// onResult until the stream ends.
+//
+// When the reader goes away — a cancelled context, an emit that failed — the
+// provider is told, because nothing else would stop it: it is sitting in a
+// Watch that ends when somebody says so. The stop call deliberately outlives
+// the cancelled context, or the message that ends the watch could not be sent
+// by the very thing that means to end it.
+func (c *Client) stream(ctx context.Context, method string, params any, onResult func(json.RawMessage) error) error {
+	req := Request{ID: c.takeID(), Method: method}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	req.Params = encoded
+
+	var failed error
+	err = c.transport.CallStream(ctx, req, func(resp Response) error {
+		if resp.Error != nil {
+			failed = coreError(resp.Error)
+			return failed
+		}
+		if len(resp.Result) == 0 {
+			return nil
+		}
+		return onResult(resp.Result)
+	})
+	if stopErr := c.stop(ctx, req.ID); stopErr != nil && err == nil && failed == nil {
+		return stopErr
+	}
+	if failed != nil {
+		return failed
+	}
+	// A cancelled context is how a reader says it has seen enough, so the watch
+	// ended the way it was asked to. Reporting it would print a failure for
+	// every stream somebody interrupted.
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+// stop ends a watch the provider may still be serving.
+func (c *Client) stop(ctx context.Context, watch int) error {
+	return c.call(context.WithoutCancel(ctx), MethodStopWatch, StopWatchParams{Watch: watch}, nil)
 }
 
 // coreError turns the wire error back into the typed one the commands key on.
@@ -120,6 +185,9 @@ func newHandler(c *Client, rt ResourceType) *handler {
 	t := core.ResourceType{
 		Group: rt.Group, Version: rt.Version, Kind: rt.Kind,
 		Plural: rt.Plural, Singular: rt.Singular, ShortNames: rt.ShortNames,
+		ListKind: rt.ListKind, Namespaced: rt.Namespaced,
+		Categories:  rt.Categories,
+		Verbs:       rt.Verbs,
 		Description: rt.Description,
 	}
 	for _, col := range rt.Columns {
@@ -149,9 +217,24 @@ func (h *handler) StatusSchema() []schema.Field { return h.rt.Status }
 // without reordering them.
 func (h *handler) NewSpec() any { return NewMap() }
 
+// ref is the triple every call carries, and namespace is whatever the command
+// put on the context. Both are spelled out on the wire for the same reason the
+// delete options are: a context does not cross a process boundary, and a
+// namespace that only rode one would arrive empty — which reads as "every
+// namespace" and answers for the wrong slice of the world.
+func (h *handler) ref() Ref { return RefOf(h.typ) }
+
+func (h *handler) kindParams(ctx context.Context) KindParams {
+	s := core.ScopeFrom(ctx)
+	return KindParams{
+		Ref: h.ref(), Namespace: s.Namespace, AllNamespaces: s.AllNamespaces,
+		LabelSelector: s.LabelSelector, FieldSelector: s.FieldSelector,
+	}
+}
+
 func (h *handler) List(ctx context.Context) ([]core.Object, error) {
 	var result ObjectsResult
-	if err := h.client.call(ctx, MethodList, KindParams{Kind: h.typ.Kind}, &result); err != nil {
+	if err := h.client.call(ctx, MethodList, h.kindParams(ctx), &result); err != nil {
 		return nil, err
 	}
 	return decodeObjects(result.Objects)
@@ -159,7 +242,9 @@ func (h *handler) List(ctx context.Context) ([]core.Object, error) {
 
 func (h *handler) Get(ctx context.Context, name string) (core.Object, error) {
 	var result ObjectResult
-	if err := h.client.call(ctx, MethodGet, NameParams{Kind: h.typ.Kind, Name: name}, &result); err != nil {
+	k := h.kindParams(ctx)
+	params := NameParams{Ref: k.Ref, Namespace: k.Namespace, AllNamespaces: k.AllNamespaces, LabelSelector: k.LabelSelector, FieldSelector: k.FieldSelector, Name: name}
+	if err := h.client.call(ctx, MethodGet, params, &result); err != nil {
 		return core.Object{}, err
 	}
 	return result.Object.Decode(nil)
@@ -167,7 +252,9 @@ func (h *handler) Get(ctx context.Context, name string) (core.Object, error) {
 
 func (h *handler) ListScoped(ctx context.Context, scope string) ([]core.Object, error) {
 	var result ObjectsResult
-	if err := h.client.call(ctx, MethodListScoped, ScopeParams{Kind: h.typ.Kind, Scope: scope}, &result); err != nil {
+	k := h.kindParams(ctx)
+	params := ScopeParams{Ref: k.Ref, Namespace: k.Namespace, AllNamespaces: k.AllNamespaces, LabelSelector: k.LabelSelector, FieldSelector: k.FieldSelector, Scope: scope}
+	if err := h.client.call(ctx, MethodListScoped, params, &result); err != nil {
 		return nil, err
 	}
 	return decodeObjects(result.Objects)
@@ -179,7 +266,7 @@ func (h *handler) Apply(ctx context.Context, obj core.Object) (core.Result, erro
 		return core.Result{}, err
 	}
 	var result ApplyResult
-	if err := h.client.call(ctx, MethodApply, ApplyParams{Kind: h.typ.Kind, Object: wire}, &result); err != nil {
+	if err := h.client.call(ctx, MethodApply, ApplyParams{Ref: h.ref(), Object: wire}, &result); err != nil {
 		return core.Result{}, err
 	}
 	applied, err := result.Object.Decode(nil)
@@ -193,20 +280,43 @@ func (h *handler) Delete(ctx context.Context, name string) error {
 	// Whatever `delete` put in the context has to be spelled out here, because
 	// the provider's context is its own.
 	opts := core.DeleteOptionsFrom(ctx)
-	params := DeleteParams{Kind: h.typ.Kind, Name: name, Cascade: opts.Cascade}
+	k := h.kindParams(ctx)
+	params := DeleteParams{Ref: k.Ref, Namespace: k.Namespace, AllNamespaces: k.AllNamespaces, LabelSelector: k.LabelSelector, FieldSelector: k.FieldSelector, Name: name, Cascade: opts.Cascade}
 	return h.client.call(ctx, MethodDelete, params, nil)
 }
 
 func (h *handler) Describe(ctx context.Context, name string) (string, error) {
 	var result TextResult
-	if err := h.client.call(ctx, MethodDescribe, NameParams{Kind: h.typ.Kind, Name: name}, &result); err != nil {
+	k := h.kindParams(ctx)
+	params := NameParams{Ref: k.Ref, Namespace: k.Namespace, AllNamespaces: k.AllNamespaces, LabelSelector: k.LabelSelector, FieldSelector: k.FieldSelector, Name: name}
+	if err := h.client.call(ctx, MethodDescribe, params, &result); err != nil {
 		return "", err
 	}
 	return result.Text, nil
 }
 
 func (h *handler) Restart(ctx context.Context, name string) error {
-	return h.client.call(ctx, MethodRestart, NameParams{Kind: h.typ.Kind, Name: name}, nil)
+	k := h.kindParams(ctx)
+	params := NameParams{Ref: k.Ref, Namespace: k.Namespace, AllNamespaces: k.AllNamespaces, LabelSelector: k.LabelSelector, FieldSelector: k.FieldSelector, Name: name}
+	return h.client.call(ctx, MethodRestart, params, nil)
+}
+
+// Watch streams the kind's changes until ctx is cancelled or emit fails.
+//
+// Every frame is decoded the way a listed object is, so a client consuming a
+// watch and a client consuming a list are looking at the same objects.
+func (h *handler) Watch(ctx context.Context, emit func(core.Event) error) error {
+	return h.client.stream(ctx, MethodWatch, h.kindParams(ctx), func(raw json.RawMessage) error {
+		var event EventResult
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return err
+		}
+		obj, err := event.Object.Decode(nil)
+		if err != nil {
+			return err
+		}
+		return emit(core.Event{Type: core.EventType(event.Type), Object: obj})
+	})
 }
 
 func decodeObjects(wire []Object) ([]core.Object, error) {
@@ -232,4 +342,5 @@ var (
 	_ core.Describer       = (*handler)(nil)
 	_ core.Restarter       = (*handler)(nil)
 	_ core.ScopedLister    = (*handler)(nil)
+	_ core.Watcher         = (*handler)(nil)
 )

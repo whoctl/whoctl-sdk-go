@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -34,12 +36,15 @@ type widgetHandler struct {
 	applied            core.Object
 	restarts           []string
 	deletedWithCascade bool
+	listedNamespace    string
 }
 
 func (h *widgetHandler) Type() core.ResourceType {
 	return core.ResourceType{
 		Group: "test.whoctl.io", Version: "v1", Kind: "Widget",
 		Plural: "widgets", Singular: "widget", ShortNames: []string{"wid"},
+		Namespaced:  true,
+		Categories:  []string{"all"},
 		Description: "A widget.",
 		Columns: []core.Column{
 			{Name: "NAME", Path: "metadata.name"},
@@ -52,18 +57,42 @@ func (h *widgetHandler) Type() core.ResourceType {
 func (h *widgetHandler) NewSpec() any   { return &widgetSpec{} }
 func (h *widgetHandler) NewStatus() any { return &widgetStatus{} }
 
+// created is fixed so a test can compare it. It is what an AGE column reads.
+var created = time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+
 func (h *widgetHandler) object(name string) core.Object {
 	t := h.Type()
 	return core.Object{
 		APIVersion: t.APIVersion(), Kind: t.Kind,
-		Metadata: core.Metadata{Name: name, Labels: map[string]string{"tier": "one"}},
-		Spec:     &widgetSpec{Size: 3, Colour: "red", Tags: []string{"a", "b"}},
-		Status:   &widgetStatus{Size: 3, Colour: "red", Tags: []string{"a", "b"}, Enabled: true, Observed: 1700000000},
+		Metadata: core.Metadata{
+			Name:              name,
+			Namespace:         "shelf",
+			UID:               "uid-" + name,
+			ResourceVersion:   "7",
+			CreationTimestamp: core.NewTime(created),
+			Labels:            map[string]string{"tier": "one"},
+		},
+		Spec:   &widgetSpec{Size: 3, Colour: "red", Tags: []string{"a", "b"}},
+		Status: &widgetStatus{Size: 3, Colour: "red", Tags: []string{"a", "b"}, Enabled: true, Observed: 1700000000},
 	}
 }
 
-func (h *widgetHandler) List(context.Context) ([]core.Object, error) {
+func (h *widgetHandler) List(ctx context.Context) ([]core.Object, error) {
+	h.listedNamespace = core.ScopeFrom(ctx).Namespace
 	return []core.Object{h.object("one"), h.object("two")}, nil
+}
+
+// Watch emits what it has and then waits to be stopped, which is the shape of
+// every real watch: the interesting part is not the events, it is that the
+// stream stays open and ends when somebody says so.
+func (h *widgetHandler) Watch(ctx context.Context, emit func(core.Event) error) error {
+	for _, name := range []string{"one", "two"} {
+		if err := emit(core.Event{Type: core.EventAdded, Object: h.object(name)}); err != nil {
+			return err
+		}
+	}
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (h *widgetHandler) Get(_ context.Context, name string) (core.Object, error) {
@@ -148,6 +177,61 @@ func handlerFor(t *testing.T, c *Client, kind string) core.Handler {
 	return nil
 }
 
+func handlerForGroup(t *testing.T, c *Client, group, kind string) core.Handler {
+	t.Helper()
+	for _, h := range c.Handlers() {
+		if rt := h.Type(); rt.Group == group && rt.Kind == kind {
+			return h
+		}
+	}
+	t.Fatalf("no handler for %s in %s", kind, group)
+	return nil
+}
+
+// --- a provider whose kinds share a name ---------------------------------
+
+// thingHandler is the same kind in two groups, which is what an aws provider
+// looks like the moment it covers ec2 and rds. It answers with its own
+// apiVersion so a test can tell which one was reached.
+type thingHandler struct{ group string }
+
+func (h *thingHandler) Type() core.ResourceType {
+	return core.ResourceType{
+		Group: h.group, Version: "v1", Kind: "Thing",
+		Plural: "things", Singular: "thing", Description: "A thing.",
+		Columns: []core.Column{{Name: "NAME", Path: "metadata.name"}},
+	}
+}
+
+func (h *thingHandler) NewSpec() any { return &widgetSpec{} }
+
+func (h *thingHandler) Get(_ context.Context, name string) (core.Object, error) {
+	t := h.Type()
+	return core.Object{
+		APIVersion: t.APIVersion(), Kind: t.Kind,
+		Metadata: core.Metadata{Name: name},
+		Spec:     &widgetSpec{Size: 1},
+	}, nil
+}
+
+func (h *thingHandler) List(context.Context) ([]core.Object, error) { return nil, nil }
+
+func (h *thingHandler) Apply(context.Context, core.Object) (core.Result, error) {
+	return core.Result{}, nil
+}
+
+func (h *thingHandler) Delete(context.Context, string) error { return nil }
+
+type twoGroupProvider struct{}
+
+func (p *twoGroupProvider) Name() string { return "test" }
+func (p *twoGroupProvider) Handlers() []core.Handler {
+	return []core.Handler{
+		&thingHandler{group: "left.test.whoctl.io"},
+		&thingHandler{group: "right.test.whoctl.io"},
+	}
+}
+
 // --- what has to survive the trip ---------------------------------------
 
 func TestHandshakeCarriesTheProviderIdentity(t *testing.T) {
@@ -180,7 +264,7 @@ func TestSchemaCarriesColumnsCapabilitiesAndFields(t *testing.T) {
 	if got := h.Type().Columns; len(got) != 3 || got[0].Path != "metadata.name" || got[2].Wide != true {
 		t.Errorf("columns = %+v", got)
 	}
-	want := []core.Capability{core.CapabilityRestart, core.CapabilityScopedList, core.CapabilityStatusSchema}
+	want := []core.Capability{core.CapabilityRestart, core.CapabilityScopedList, core.CapabilityStatusSchema, core.CapabilityWatch}
 	got := core.CapabilitiesOf(h)
 	if len(got) != len(want) {
 		t.Fatalf("capabilities = %v, want %v", got, want)
@@ -235,6 +319,10 @@ func TestFieldOrderSurvivesTheRoundTrip(t *testing.T) {
 kind: Widget
 metadata:
   name: one
+  namespace: shelf
+  uid: uid-one
+  resourceVersion: "7"
+  creationTimestamp: "2024-03-01T12:00:00Z"
   labels:
     tier: one
 spec:
@@ -503,6 +591,158 @@ func TestEveryDeleteOptionCrossesTheWire(t *testing.T) {
 		if wire.Type != field.Type {
 			t.Errorf("DeleteParams.%s is %s, want %s", field.Name, wire.Type, field.Type)
 		}
+	}
+}
+
+// The same rule for the scope. A namespace that only rode the context would
+// arrive empty on the far side, and an empty namespace does not fail — it means
+// "every namespace", so a provider would quietly answer for the whole world
+// when it was asked about one slice of it.
+func TestEveryScopeFieldCrossesTheWire(t *testing.T) {
+	scope := reflect.TypeFor[core.Scope]()
+	for _, params := range []reflect.Type{
+		reflect.TypeFor[KindParams](),
+		reflect.TypeFor[NameParams](),
+		reflect.TypeFor[ScopeParams](),
+		reflect.TypeFor[DeleteParams](),
+	} {
+		for i := range scope.NumField() {
+			field := scope.Field(i)
+			wire, ok := params.FieldByName(field.Name)
+			if !ok {
+				t.Errorf("core.Scope.%s has no field on protocol.%s, so it cannot reach a provider in another process",
+					field.Name, params.Name())
+				continue
+			}
+			if wire.Type != field.Type {
+				t.Errorf("%s.%s is %s, want %s", params.Name(), field.Name, wire.Type, field.Type)
+			}
+		}
+	}
+}
+
+// And it really arrives.
+func TestTheNamespaceReachesTheProvider(t *testing.T) {
+	h := &widgetHandler{}
+	client, err := Serve(context.Background(), NewServerOf(&fakeProvider{widget: h}), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := core.WithScope(context.Background(), core.Scope{Namespace: "eu-west-1"})
+	if _, err := handlerFor(t, client, "Widget").List(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h.listedNamespace != "eu-west-1" {
+		t.Errorf("the provider listed namespace %q, want %q", h.listedNamespace, "eu-west-1")
+	}
+}
+
+// Two kinds of the same name in different groups is the ordinary shape of a
+// provider covering several services of one cloud — Instance under ec2 and
+// Instance under rds. Dispatch keyed on the kind alone did not fail here: one
+// handler replaced the other in a map and answered for both.
+func TestTwoKindsMayShareANameInDifferentGroups(t *testing.T) {
+	client, err := Serve(context.Background(), NewServerOf(&twoGroupProvider{}), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(client.Handlers()); n != 2 {
+		t.Fatalf("%d handlers, want 2", n)
+	}
+	for _, group := range []string{"left.test.whoctl.io", "right.test.whoctl.io"} {
+		h := handlerForGroup(t, client, group, "Thing")
+		obj, err := h.Get(context.Background(), "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Each handler answers with its own group, which is the only proof that
+		// the right one was reached.
+		if obj.APIVersion != group+"/v1" {
+			t.Errorf("%s answered as %q", group, obj.APIVersion)
+		}
+	}
+}
+
+// A watch streams until it is stopped, and stopping it is the reader's decision.
+func TestWatchStreamsEventsAndStopsWhenTold(t *testing.T) {
+	client, _ := served(t)
+	h := handlerFor(t, client, "Widget")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var seen []string
+	err := h.(core.Watcher).Watch(ctx, func(e core.Event) error {
+		if e.Type != core.EventAdded {
+			t.Errorf("event type = %q", e.Type)
+		}
+		if e.Object.Metadata.UID == "" {
+			t.Error("a watched object arrived without its uid")
+		}
+		seen = append(seen, e.Object.Metadata.Name)
+		if len(seen) == 2 {
+			cancel()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	if len(seen) != 2 || seen[0] != "one" || seen[1] != "two" {
+		t.Errorf("saw %v", seen)
+	}
+}
+
+// A kind that cannot be watched says so rather than hanging.
+func TestAKindThatIsNotWatchedRefusesToBe(t *testing.T) {
+	client, _ := served(t)
+	err := handlerFor(t, client, "Gadget").(core.Watcher).
+		Watch(context.Background(), func(core.Event) error { return nil })
+	if core.CodeOf(err) != core.CodeUnsupported {
+		t.Errorf("watching a Gadget failed with %v, want %s", err, core.CodeUnsupported)
+	}
+}
+
+// The fields a Kubernetes client reads to be more than a table: AGE comes from
+// the creation timestamp, and a watch is resumed from a resource version.
+func TestTheIdentityAKubernetesClientNeedsSurvives(t *testing.T) {
+	client, _ := served(t)
+	obj, err := handlerFor(t, client, "Widget").Get(context.Background(), "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := obj.Metadata
+	if m.UID != "uid-one" || m.ResourceVersion != "7" || m.Namespace != "shelf" {
+		t.Errorf("metadata = %+v", m)
+	}
+	if !m.CreationTimestamp.Equal(created) {
+		t.Errorf("creationTimestamp = %v, want %v", m.CreationTimestamp, created)
+	}
+}
+
+// The schema is a discovery document in everything but name, so it has to carry
+// what discovery carries.
+func TestSchemaCarriesTheFactsDiscoveryNeeds(t *testing.T) {
+	client, _ := served(t)
+	widget := handlerFor(t, client, "Widget").Type()
+
+	if widget.CollectionKind() != "WidgetList" {
+		t.Errorf("listKind = %q", widget.CollectionKind())
+	}
+	if !widget.Namespaced {
+		t.Error("Widget arrived as cluster-scoped")
+	}
+	if !reflect.DeepEqual(widget.Categories, []string{"all"}) {
+		t.Errorf("categories = %v", widget.Categories)
+	}
+	// Verbs are resolved by the provider, not defaulted on arrival, so the two
+	// sides cannot disagree about what a kind serves.
+	want := []string{core.VerbGet, core.VerbList, core.VerbCreate, core.VerbUpdate, core.VerbDelete, core.VerbWatch}
+	if !reflect.DeepEqual(widget.Verbs, want) {
+		t.Errorf("verbs = %v, want %v", widget.Verbs, want)
+	}
+	if gadget := handlerFor(t, client, "Gadget").Type(); slices.Contains(gadget.Verbs, core.VerbWatch) {
+		t.Errorf("Gadget publishes watch and cannot serve it: %v", gadget.Verbs)
 	}
 }
 
