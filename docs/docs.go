@@ -111,6 +111,10 @@ type Options struct {
 const DefaultSubcategory = "Resources"
 
 // verbs every handler serves, because core.Handler requires them.
+// These are the verbs of the command line, which a page documents because it is
+// read by somebody about to type one. They are not core.KnownVerbs: those are
+// Kubernetes' and go into the schema, for a client that has never heard of
+// `whoctl edit`. Two audiences, two vocabularies — see core/verbs.go.
 var baseVerbs = []string{"get", "describe", "apply", "edit", "delete"}
 
 // Build reads a set of providers and their embedded pages, and returns the site
